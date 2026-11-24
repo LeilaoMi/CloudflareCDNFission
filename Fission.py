@@ -7,13 +7,15 @@
 #   2. 先滤再验：IP 写回 Fission_ip.txt 之前先过两道过滤 --
 #      (a) Cloudflare 官方 IPv4 段（下面 CF_IPV4_RANGES）；
 #      (b) ASN 13335 / 209242（Cloudflare 自身 ASN），用 Team Cymru 的
-#          DNS ASN 查询（同样走 DoH，不新增依赖）。
+#          DNS ASN 查询（同样走 DoH，不新增依赖），收集全部 origin ASN，
+#          任一命中即丢弃。
 #      查不到 ASN 时不丢弃该 IP（宁可留给下游验证器判，不静默丢数），
 #      只有确认为 13335 / 209242 时才丢弃。过滤结果会打印计数。
 #   3. 反查站点只留 ip138 与 ipchaxun，删掉已死的 dnsdblookup
 #      （2026-11-25 实测：dnsdblookup.com 15 秒超时，0 字节）。
 #      两个站的请求改为串行 + 每次间隔至少 1 秒，失败自动换站重试，
-#      两站都失败返回空列表，不抛异常中断整批。
+#      两站都失败返回空列表，不抛异常中断整批。反查请求不走适配器
+#      自动重试（否则内部重试会绕过 1 秒间隔），DoH 仍保留重试。
 #   4. 去掉 fake_useragent（它启动时要拉远程 UA 列表），改用固定 UA。
 #
 # 不做的事：不加延迟 / TLS / SNI 验证层，不改输出文件名，
@@ -82,9 +84,11 @@ USER_AGENT = "Mozilla/5.0 (compatible; CloudflareCDNFission/route-c)"
 
 
 # 设置会话
-def setup_session():
+# retries_total=0 时适配器不自动重试：反查请求失败要直接进入限速换站
+# 路径，而不是在 session.get() 内部重试、绕过 1 秒间隔。DoH 用默认值 5。
+def setup_session(retries_total=5):
     session = requests.Session()
-    retries = Retry(total=5, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+    retries = Retry(total=retries_total, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retries)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
@@ -146,7 +150,8 @@ def fetch_domains_for_ip(ip_address, session, attempts=0, used_sites=None):
 
 # 并发处理所有IP地址
 def fetch_domains_concurrently(ip_addresses):
-    session = setup_session()
+    # 反查会话关闭适配器自动重试：失败直接换站，内部重试会绕过 1 秒限速
+    session = setup_session(retries_total=0)
     domains = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_request) as executor:
@@ -173,13 +178,16 @@ def doh_lookup(domain, session):
         return domain, []
 
 
-# Team Cymru DNS ASN 查询（走 DoH）：查不到返回 None，调用方不丢弃该 IP
+# Team Cymru DNS ASN 查询（走 DoH）：返回全部 origin ASN 的集合，查不到返回 None
+# 同一前缀可能有多个 origin ASN（首字段为空格分隔的列表），同一地址也可能
+# 返回多条 TXT 答案；只读第一条、只取第一个数字会漏掉 13335 / 209242。
+# 所以遍历全部答案、收集首字段里的全部数字，调用方任一命中即丢弃。
 _asn_cache = {}
 
-def lookup_asn(ip, session):
+def lookup_asns(ip, session):
     if ip in _asn_cache:
         return _asn_cache[ip]
-    asn = None
+    asns = set()
     try:
         reversed_ip = '.'.join(reversed(ip.split('.')))
         response = session.get(
@@ -192,13 +200,14 @@ def lookup_asn(ip, session):
         for answer in data.get("Answer", []):
             if answer.get("type") == 16:
                 first_field = answer.get("data", "").strip('"').split("|")[0].strip()
-                if first_field.isdigit():
-                    asn = int(first_field)
-                    break
+                for token in first_field.split():
+                    if token.isdigit():
+                        asns.add(int(token))
     except Exception as e:
         print(f"Error ASN lookup for {ip}: {e}")
-    _asn_cache[ip] = asn
-    return asn
+    result = asns or None
+    _asn_cache[ip] = result
+    return result
 
 
 def is_cloudflare_ip(ip):
@@ -228,8 +237,8 @@ def filter_candidate_ips(ip_set, session):
         if is_cloudflare_ip(ip):
             dropped_cf_range += 1
             continue
-        asn = lookup_asn(ip, session)
-        if asn is not None and asn in CF_ASNS:
+        asns = lookup_asns(ip, session)
+        if asns is not None and asns & CF_ASNS:
             dropped_cf_asn += 1
             continue
         kept.add(ip)
