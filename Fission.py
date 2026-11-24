@@ -169,9 +169,9 @@ def reverse_otx(ip):
     for attempt in range(4):
         _limits["otx"].wait()
         r = session.get(url, headers=headers, timeout=30)
-        if r.status_code != 429:
+        if r.status_code not in (429, 502, 503, 504):
             break
-        # 限流：按 Retry-After 退避，同时把后续请求的间隔拉长
+        # 限流或 OTX 网关超时：按 Retry-After 退避，同时把后续请求的间隔拉长
         try:
             wait = min(float(r.headers.get("Retry-After", "")), 120.0)
         except ValueError:
