@@ -1,28 +1,24 @@
-# CloudflareCDNFission -- 裂变扩源 + 验证（2026-11-25 改造）
+# CloudflareCDNFission -- 只采集 IP（2026-11-25 改造）
+#
+# 本仓库只负责“找 IP”，不做可用性验证；验证交给下游（如 preferred-sub-generator）或使用者自己。
 #
 # 一轮流程：
-#   种子 IP（seeds.txt，可直接放 FOFA 导出的 CSV）
-#     -> 反查同 IP 域名（AlienVault OTX passive DNS + ip138 + ipchaxun，取并集）
-#     -> DoH 解析回 IPv4
-#     -> 丢掉 Cloudflare 公开段、私网/保留地址、种子本身、已知来源里已有的 IP
-#     -> 验证：TLS(SNI=VERIFY_HOST) + GET /cdn-cgi/trace，拿到 colo 才算活
-#     -> 打标签：cf-asn（CF ASN 代播，只能当优选）/ proxyip-XX（过 ProxyIP 检测，XX=出口国家）/ relay
-#     -> 输出 output/alive.txt（ip:443#标签-colo），活 IP 另写 output/seeds_next.txt
-#
-# 与原版的区别：
-#   * 候选和种子分开：未验证的 IP 不回灌成下一轮种子（原版越跑越多的大多是死 IP）。
-#   * CF ASN（13335 / 209242）不再丢弃，改成标签：这类 IP 当优选入口实测可用，只是不能当 ProxyIP。
-#   * 反查源取并集，OTX 走 JSON API，ip138 / ipchaxun 抓页面，按站限速。
-#   * 不做全网扫描，只验证裂变出的候选。
+#   1. Netlas（可选，需 NETLAS_API_KEY）：按 IP 段切片下载“美国、server=cloudflare、443、403”的主机，
+#      进度存在 output/netlas_state.json，每轮只花 NETLAS_MAX_REQUESTS 次请求，几轮轮完一遍再从头开始
+#   2. 种子 = seeds.txt + secret FISSION_SEEDS + 本轮 Netlas 新 IP，按 /24 去重
+#   3. 反查同 IP 域名（AlienVault OTX passive DNS + ip138 + ipchaxun，取并集）
+#   4. DoH 解析回 IPv4
+#   5. 丢掉 Cloudflare 官方段和私网/保留地址
+#   6. 并进 output/ips.txt（一行一个 IP，累积去重），写 output/report.json
 #
 # 环境变量：
-#   VERIFY_HOST   验证用 SNI / Host，默认 speed.cloudflare.com（可换成自己的 Worker 域名）
-#   CHECK_API     ProxyIP 检测接口，形如 https://example.com/check（调用 ?proxyip=ip:443），留空则跳过
-#   KNOWN_URLS    已知来源 URL，逗号分隔；其中出现过的 IP 视为非新增
-#   MAX_SEEDS     每轮最多用多少个种子（按 /24 去重后），默认 200
-#   OTX_TIMEOUT   OTX 单次请求超时秒数，默认 60（passive_dns 常要 40s 左右）
-#   OTX_BUDGET    本轮花在 OTX 上的总秒数上限，默认 1500；超了或冷却等不起就停用 OTX
-#   OTX_API_KEY   AlienVault OTX 的免费 API key（可选；不填也能用，但很快会被 429 限流）
+#   NETLAS_API_KEY       Netlas key（可选）；不填就跳过 Netlas
+#   NETLAS_QUERY         Netlas 查询，默认见 NETLAS_DEFAULT_QUERY
+#   NETLAS_MAX_REQUESTS  本轮最多调多少次 Netlas API，默认 45（免费版约 50 次/天）
+#   MAX_SEEDS            每轮最多用多少个种子做裂变（/24 去重后），默认 200；0 表示不裂变
+#   OTX_API_KEY          AlienVault OTX 免费 key（可选；不填很快会被 429 限流）
+#   OTX_TIMEOUT          OTX 单次请求超时秒数，默认 60
+#   OTX_BUDGET           本轮花在 OTX 上的总秒数上限，默认 1500
 
 import concurrent.futures as cf
 import ipaddress
@@ -31,8 +27,6 @@ import os
 import re
 import datetime
 import email.utils
-import socket
-import ssl
 import sys
 import threading
 import time
@@ -41,12 +35,18 @@ import requests
 from lxml import etree
 
 SEEDS_FILE = "seeds.txt"
-KNOWN_FILE = "known.txt"
 OUT_DIR = "output"
+IPS_FILE = f"{OUT_DIR}/ips.txt"
+NETLAS_STATE_FILE = f"{OUT_DIR}/netlas_state.json"
 
-VERIFY_HOST = os.environ.get("VERIFY_HOST", "speed.cloudflare.com")
-CHECK_API = os.environ.get("CHECK_API", "").strip()
-KNOWN_URLS = [u.strip() for u in os.environ.get("KNOWN_URLS", "").split(",") if u.strip()]
+NETLAS_API_KEY = os.environ.get("NETLAS_API_KEY", "").strip()
+NETLAS_DEFAULT_QUERY = ('http.headers.server:"cloudflare" AND port:443 AND http.status_code:403 '
+                        'AND geo.country:US AND host_type:ip')
+NETLAS_QUERY = os.environ.get("NETLAS_QUERY", "").strip() or NETLAS_DEFAULT_QUERY
+NETLAS_MAX_REQUESTS = int(os.environ.get("NETLAS_MAX_REQUESTS", "45"))
+NETLAS_API = "https://app.netlas.io/api"
+NETLAS_PAGE = 200          # 免费版单次下载上限
+NETLAS_MIN_PREFIX = 24     # 切到 /24 还超就只拿前 200 条
 MAX_SEEDS = int(os.environ.get("MAX_SEEDS", "200"))
 OTX_API_KEY = os.environ.get("OTX_API_KEY", "").strip()
 OTX_TIMEOUT = float(os.environ.get("OTX_TIMEOUT", "60"))
@@ -61,7 +61,6 @@ CF_IPV4_FALLBACK = [
     "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
     "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
 ]
-CF_ASNS = {13335, 209242}
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -123,20 +122,6 @@ def load_cf_networks():
 def in_networks(ip, nets):
     addr = ipaddress.ip_address(ip)
     return any(addr in n for n in nets)
-
-
-def load_known():
-    known = set(read_ips(KNOWN_FILE))
-    for url in KNOWN_URLS:
-        try:
-            r = session.get(url, timeout=30)
-            r.raise_for_status()
-            got = set(IPV4_RE.findall(r.text))
-            known |= got
-            log(f"已知来源 {url}: {len(got)}")
-        except Exception as e:
-            log(f"已知来源拉取失败 {url}: {e}")
-    return known
 
 
 # ---------- 反查 ----------
@@ -285,153 +270,117 @@ def doh_a(domain):
     return domain, []
 
 
-def asn_of(ip):
-    rev = ".".join(reversed(ip.split(".")))
+# ---------- Netlas ----------
+
+def _netlas(method, path, **kw):
+    headers = {"X-API-Key": NETLAS_API_KEY}
+    r = session.request(method, f"{NETLAS_API}{path}", headers=headers, timeout=120, **kw)
+    if r.status_code == 429:
+        raise RuntimeError("Netlas 429 限流")
+    r.raise_for_status()
+    return r.json()
+
+
+def split_cidr(cidr):
+    net = ipaddress.ip_network(cidr)
+    return [str(n) for n in net.subnets(prefixlen_diff=1)]
+
+
+def load_netlas_state():
     try:
-        r = session.get(DOH_URL, params={"name": f"{rev}.origin.asn.cymru.com", "type": "TXT"}, timeout=10)
-        r.raise_for_status()
-        asns = set()
-        for a in r.json().get("Answer", []):
-            first = a.get("data", "").strip('"').split("|")[0]
-            asns |= {int(t) for t in first.split() if t.isdigit()}
-        return asns
-    except Exception:
-        return set()
+        with open(NETLAS_STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+        if st.get("query") == NETLAS_QUERY and isinstance(st.get("queue"), list):
+            return st
+    except (OSError, ValueError):
+        pass
+    return {"query": NETLAS_QUERY, "queue": ["0.0.0.0/0"], "cycles_done": 0}
 
 
-# ---------- 验证 ----------
-
-_ctx = ssl.create_default_context()
-
-
-def parse_trace(buf):
-    """只接受 2xx 响应里的 colo。"""
-    head, _, body = buf.partition(b"\r\n\r\n")
-    m = re.match(rb"HTTP/\d(?:\.\d)? (\d{3})", head)
-    if not m or not 200 <= int(m.group(1)) < 300:
-        return None
-    m = re.search(rb"(?m)^colo=([A-Z]{3})\s*$", body)
-    return m.group(1).decode() if m else None
-
-
-def trace(ip, host=VERIFY_HOST, timeout=6):
-    """TLS(SNI=host, 校验证书) 连 ip:443，GET /cdn-cgi/trace，返回 colo 或 None。"""
-    try:
-        with socket.create_connection((ip, 443), timeout=timeout) as raw:
-            with _ctx.wrap_socket(raw, server_hostname=host) as s:
-                s.settimeout(timeout)
-                s.sendall(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\n"
-                          f"User-Agent: {USER_AGENT}\r\nConnection: close\r\n\r\n".encode())
-                buf = b""
-                while len(buf) < 8192:
-                    chunk = s.recv(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-        return parse_trace(buf)
-    except Exception:
-        return None
-
-
-def check_proxyip(ip):
-    if not CHECK_API:
-        return None
-    try:
-        r = session.get(CHECK_API, params={"proxyip": f"{ip}:443"}, timeout=30)
-        if not r.ok:
-            return None
-        j = r.json()
-        if not j.get("success"):
-            return None
-        exit_ = (j.get("probe_results", {}).get("ipv4") or {}).get("exit") or {}
-        return exit_.get("country") or "XX"
-    except Exception:
-        return None
-
-
-def classify(ip, colo, asns, proxy_country):
-    if asns & CF_ASNS:
-        tag = "cf-asn"
-    elif proxy_country:
-        tag = f"proxyip-{proxy_country}"
-    else:
-        tag = "relay"
-    return f"{ip}:443#{tag}-{colo}"
+def collect_netlas():
+    """按 IP 段切片：段内 <=200 条就整段下载，否则对半切再排队。返回本轮拿到的 IPv4 集合。"""
+    if not NETLAS_API_KEY or NETLAS_MAX_REQUESTS <= 0:
+        return set(), {"skipped": True}
+    st = load_netlas_state()
+    got, used, stats = set(), 0, {"count_calls": 0, "downloads": 0, "slices_done": 0}
+    while used < NETLAS_MAX_REQUESTS:
+        if not st["queue"]:
+            st["queue"] = ["0.0.0.0/0"]
+            st["cycles_done"] = st.get("cycles_done", 0) + 1
+            break
+        cidr = st["queue"][0]
+        q = f'{NETLAS_QUERY} AND ip:"{cidr}"'
+        try:
+            n = _netlas("GET", "/responses_count/", params={"q": q})["count"]
+            used += 1
+            stats["count_calls"] += 1
+            if n > NETLAS_PAGE and ipaddress.ip_network(cidr).prefixlen < NETLAS_MIN_PREFIX:
+                st["queue"] = split_cidr(cidr) + st["queue"][1:]
+                continue
+            if n and used < NETLAS_MAX_REQUESTS:
+                body = {"q": q, "fields": ["ip"], "source_type": "include",
+                        "size": min(n, NETLAS_PAGE), "type": "json", "indices": ""}
+                rows = _netlas("POST", "/responses/download/", json=body)
+                used += 1
+                stats["downloads"] += 1
+                got |= {r.get("data", {}).get("ip") for r in rows} - {None}
+            elif n:
+                break  # 预算只够数不够下，留到下轮
+            st["queue"].pop(0)
+            stats["slices_done"] += 1
+        except Exception as e:
+            log(f"Netlas 停止：{e}")
+            stats["error"] = str(e)[:200]
+            break
+    stats.update(requests=used, ips=len(got), queue_left=len(st["queue"]), cycles_done=st.get("cycles_done", 0))
+    with open(NETLAS_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+    log(f"Netlas：{stats}")
+    return {ip for ip in got if IPV4_RE.fullmatch(ip)}, stats
 
 
 # ---------- 主流程 ----------
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    seeds_all = [ip for ip in read_ips(SEEDS_FILE) if is_public(ip)]
-    seeds = dedupe_by_24(seeds_all)[:MAX_SEEDS]
-    if not seeds:
-        log(f"{SEEDS_FILE} 里没有可用种子（可直接放 FOFA 导出的 CSV）")
-        return 1
-    log(f"种子 {len(seeds_all)}，按 /24 去重后用 {len(seeds)}")
-
     cf_nets = load_cf_networks()
-    known = load_known()
 
-    # 1. 反查（每个种子三源并行、各自限速；种子之间并发 8，OTX 慢所以要并发）
-    domains, per_seed = set(), {}
-    with cf.ThreadPoolExecutor(8) as ex:
-        for ip, doms, stats in ex.map(reverse_lookup, seeds):
-            per_seed[ip] = stats
-            domains |= doms
-    log(f"反查域名 {len(domains)}")
+    def keep(ip):
+        return is_public(ip) and not in_networks(ip, cf_nets)
 
-    # 2. DoH 解析
-    resolved = {}
-    with cf.ThreadPoolExecutor(16) as ex:
-        for d, ips in ex.map(doh_a, sorted(domains)):
-            resolved[d] = ips
-    all_ips = {ip for ips in resolved.values() for ip in ips}
+    # 1. Netlas
+    netlas_ips, netlas_stats = collect_netlas()
+    netlas_ips = {ip for ip in netlas_ips if keep(ip)}
 
-    # 3. 过滤
-    seed_set = set(seeds_all)
-    stats = {"resolved_ips": len(all_ips)}
-    cands = []
-    for ip in sorted(all_ips):
-        if not is_public(ip) or ip in seed_set:
-            continue
-        if in_networks(ip, cf_nets):
-            stats["cf_range"] = stats.get("cf_range", 0) + 1
-            continue
-        if ip in known:
-            stats["known"] = stats.get("known", 0) + 1
-            continue
-        cands.append(ip)
-    stats["new_candidates"] = len(cands)
-    log(f"过滤：{stats}")
+    # 2. 种子
+    seeds_all = [ip for ip in read_ips(SEEDS_FILE) + sorted(netlas_ips) if is_public(ip)]
+    seeds = dedupe_by_24(seeds_all)[:MAX_SEEDS] if MAX_SEEDS > 0 else []
+    log(f"种子 {len(seeds_all)}，按 /24 去重后裂变 {len(seeds)}")
 
-    # 4. 验证
-    alive = {}
-    with cf.ThreadPoolExecutor(32) as ex:
-        for ip, colo in zip(cands, ex.map(trace, cands)):
-            if colo:
-                alive[ip] = colo
-    stats["alive"] = len(alive)
+    # 3. 反查 + 4. DoH 解析
+    domains, per_seed, fission_ips = set(), {}, set()
+    if seeds:
+        with cf.ThreadPoolExecutor(8) as ex:
+            for ip, doms, st in ex.map(reverse_lookup, seeds):
+                per_seed[ip] = st
+                domains |= doms
+        log(f"反查域名 {len(domains)}")
+        with cf.ThreadPoolExecutor(16) as ex:
+            for _, ips in ex.map(doh_a, sorted(domains)):
+                fission_ips.update(ip for ip in ips if keep(ip))
 
-    lines = []
-    with cf.ThreadPoolExecutor(8) as ex:
-        ips = sorted(alive)
-        asn_list = list(ex.map(asn_of, ips))
-        proxy_list = list(ex.map(lambda i, a: None if a & CF_ASNS else check_proxyip(i), ips, asn_list))
-    for ip, asns, pc in zip(ips, asn_list, proxy_list):
-        lines.append(classify(ip, alive[ip], asns, pc))
-    stats["proxyip"] = sum(1 for l in lines if "#proxyip-" in l)
-    log(f"验证：活 {stats['alive']}，ProxyIP 可用 {stats['proxyip']}")
-
-    with open(f"{OUT_DIR}/candidates.txt", "w") as f:
-        f.write("\n".join(cands) + ("\n" if cands else ""))
-    with open(f"{OUT_DIR}/alive.txt", "w") as f:
-        f.write("\n".join(lines) + ("\n" if lines else ""))
-    with open(f"{OUT_DIR}/seeds_next.txt", "w") as f:
-        f.write("\n".join(sorted(alive)) + ("\n" if alive else ""))
+    # 5. 合并输出（累积去重）
+    old = set(read_ips(IPS_FILE))
+    found = netlas_ips | fission_ips | {ip for ip in seeds_all if keep(ip)}
+    merged = sorted(old | found, key=ipaddress.ip_address)
+    with open(IPS_FILE, "w") as f:
+        f.write("\n".join(merged) + ("\n" if merged else ""))
+    stats = {"netlas": netlas_stats, "seeds_used": len(seeds), "domains": len(domains),
+             "netlas_ips": len(netlas_ips), "fission_ips": len(fission_ips),
+             "new_this_run": len(found - old), "total": len(merged)}
     with open(f"{OUT_DIR}/report.json", "w") as f:
-        json.dump({"verify_host": VERIFY_HOST, "seeds_used": len(seeds), "domains": len(domains),
-                   "stats": stats, "per_seed": per_seed}, f, ensure_ascii=False, indent=1)
+        json.dump({"stats": stats, "per_seed": per_seed}, f, ensure_ascii=False, indent=1)
+    log(f"完成：{stats}")
     return 0
 
 

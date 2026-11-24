@@ -34,20 +34,6 @@ def test_clean_domains():
     assert got == {"www.example.com", "foo.org"}
 
 
-def test_classify():
-    assert F.classify("1.1.1.1", "SJC", {13335}, "US") == "1.1.1.1:443#cf-asn-SJC"
-    assert F.classify("2.2.2.2", "LAX", {36352}, "US") == "2.2.2.2:443#proxyip-US-LAX"
-    assert F.classify("3.3.3.3", "PDX", set(), None) == "3.3.3.3:443#relay-PDX"
-
-
-def test_parse_trace_requires_2xx():
-    ok = b"HTTP/1.1 200 OK\r\nServer: cloudflare\r\n\r\nfl=1\nh=x\ncolo=SJC\n"
-    bad = b"HTTP/1.1 503 Service Unavailable\r\n\r\ncolo=SJC\n"
-    assert F.parse_trace(ok) == "SJC"
-    assert F.parse_trace(bad) is None
-    assert F.parse_trace(b"garbage colo=SJC") is None
-
-
 def test_retry_after_seconds_and_http_date():
     import datetime
     now = datetime.datetime(2026, 11, 25, 0, 0, 0, tzinfo=datetime.timezone.utc)
@@ -57,11 +43,34 @@ def test_retry_after_seconds_and_http_date():
     assert F.retry_after_seconds(None) is None
 
 
-def test_check_proxyip_rejects_non_2xx(monkeypatch):
-    class Resp:
-        ok = False
-        def json(self):
-            return {"success": True, "probe_results": {"ipv4": {"exit": {"country": "US"}}}}
-    monkeypatch.setattr(F, "CHECK_API", "https://example.invalid/check")
-    monkeypatch.setattr(F.session, "get", lambda *a, **k: Resp())
-    assert F.check_proxyip("192.0.2.1") is None
+def test_split_cidr():
+    assert F.split_cidr("0.0.0.0/0") == ["0.0.0.0/1", "128.0.0.0/1"]
+    assert F.split_cidr("64.0.0.0/8") == ["64.0.0.0/9", "64.128.0.0/9"]
+
+
+def test_netlas_state_resets_on_query_change(tmp_path, monkeypatch):
+    p = tmp_path / "st.json"
+    p.write_text('{"query": "old", "queue": ["1.0.0.0/8"], "cycles_done": 2}')
+    monkeypatch.setattr(F, "NETLAS_STATE_FILE", str(p))
+    assert F.load_netlas_state()["queue"] == ["0.0.0.0/0"]
+    p.write_text('{"query": %s, "queue": ["1.0.0.0/8"]}' % __import__("json").dumps(F.NETLAS_QUERY))
+    assert F.load_netlas_state()["queue"] == ["1.0.0.0/8"]
+
+
+def test_collect_netlas_splits_and_downloads(tmp_path, monkeypatch):
+    monkeypatch.setattr(F, "NETLAS_STATE_FILE", str(tmp_path / "st.json"))
+    monkeypatch.setattr(F, "NETLAS_API_KEY", "k")
+    monkeypatch.setattr(F, "NETLAS_MAX_REQUESTS", 10)
+    counts = {"0.0.0.0/0": 300, "0.0.0.0/1": 150, "128.0.0.0/1": 0}
+
+    def fake(method, path, **kw):
+        if path == "/responses_count/":
+            cidr = kw["params"]["q"].rsplit('ip:"', 1)[1].rstrip('"')
+            return {"count": counts[cidr]}
+        return [{"data": {"ip": "64.1.2.3"}}, {"data": {"ip": "64.1.2.3"}}]
+
+    monkeypatch.setattr(F, "_netlas", fake)
+    ips, st = F.collect_netlas()
+    assert ips == {"64.1.2.3"}
+    assert st["count_calls"] == 3 and st["downloads"] == 1
+

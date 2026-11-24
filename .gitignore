@@ -1,5 +1,7 @@
 seeds.txt
-known.txt
-output/
+output/*
+!output/ips.txt
+!output/netlas_state.json
+!output/report.json
 __pycache__/
 .pytest_cache/

@@ -1,24 +1,28 @@
 name: Fission
 
 on:
+  schedule:
+    - cron: "30 20 * * *"   # 每天北京时间 04:30
   workflow_dispatch:
     inputs:
-      verify_host:
-        description: "验证用 SNI / Host（默认 speed.cloudflare.com）"
-        required: false
-        default: ""
       max_seeds:
-        description: "最多用多少个种子（/24 去重后）"
+        description: "最多用多少个种子做裂变（/24 去重后，0 = 只跑 Netlas）"
         required: false
         default: "200"
 
 permissions:
   contents: read
 
+concurrency:
+  group: fission
+  cancel-in-progress: false
+
 jobs:
   fission:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,18 +34,19 @@ jobs:
         env:
           FISSION_SEEDS: ${{ secrets.FISSION_SEEDS }}
         run: |
-          if [ -z "$FISSION_SEEDS" ]; then echo "::error::请先设置仓库 secret FISSION_SEEDS（一行一个 IP，或直接贴 FOFA CSV）"; exit 1; fi
-          printf '%s\n' "$FISSION_SEEDS" > seeds.txt
+          if [ -n "$FISSION_SEEDS" ]; then printf '%s\n' "$FISSION_SEEDS" >> seeds.txt; fi
       - name: Run
         env:
-          VERIFY_HOST: ${{ inputs.verify_host || vars.VERIFY_HOST || 'speed.cloudflare.com' }}
-          CHECK_API: ${{ vars.CHECK_API }}
+          NETLAS_API_KEY: ${{ secrets.NETLAS_API_KEY }}
           OTX_API_KEY: ${{ secrets.OTX_API_KEY }}
-          KNOWN_URLS: ${{ vars.KNOWN_URLS }}
-          MAX_SEEDS: ${{ inputs.max_seeds }}
+          NETLAS_QUERY: ${{ vars.NETLAS_QUERY }}
+          MAX_SEEDS: ${{ inputs.max_seeds || '200' }}
         run: python Fission.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fission-output
-          path: output/
-          retention-days: 3
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/ips.txt output/netlas_state.json output/report.json
+          if git diff --cached --quiet; then echo "无变化"; exit 0; fi
+          git commit -m "data: $(date -u +%F) 更新 IP 列表"
+          git push
