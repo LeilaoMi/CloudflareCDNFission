@@ -38,3 +38,30 @@ def test_classify():
     assert F.classify("1.1.1.1", "SJC", {13335}, "US") == "1.1.1.1:443#cf-asn-SJC"
     assert F.classify("2.2.2.2", "LAX", {36352}, "US") == "2.2.2.2:443#proxyip-US-LAX"
     assert F.classify("3.3.3.3", "PDX", set(), None) == "3.3.3.3:443#relay-PDX"
+
+
+def test_parse_trace_requires_2xx():
+    ok = b"HTTP/1.1 200 OK\r\nServer: cloudflare\r\n\r\nfl=1\nh=x\ncolo=SJC\n"
+    bad = b"HTTP/1.1 503 Service Unavailable\r\n\r\ncolo=SJC\n"
+    assert F.parse_trace(ok) == "SJC"
+    assert F.parse_trace(bad) is None
+    assert F.parse_trace(b"garbage colo=SJC") is None
+
+
+def test_retry_after_seconds_and_http_date():
+    import datetime
+    now = datetime.datetime(2026, 11, 25, 0, 0, 0, tzinfo=datetime.timezone.utc)
+    assert F.retry_after_seconds("600") == 600.0
+    assert F.retry_after_seconds("Wed, 25 Nov 2026 00:10:00 GMT", now=now) == 600.0
+    assert F.retry_after_seconds("nonsense") is None
+    assert F.retry_after_seconds(None) is None
+
+
+def test_check_proxyip_rejects_non_2xx(monkeypatch):
+    class Resp:
+        ok = False
+        def json(self):
+            return {"success": True, "probe_results": {"ipv4": {"exit": {"country": "US"}}}}
+    monkeypatch.setattr(F, "CHECK_API", "https://example.invalid/check")
+    monkeypatch.setattr(F.session, "get", lambda *a, **k: Resp())
+    assert F.check_proxyip("192.0.2.1") is None

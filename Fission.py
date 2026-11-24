@@ -20,6 +20,8 @@
 #   CHECK_API     ProxyIP 检测接口，形如 https://example.com/check（调用 ?proxyip=ip:443），留空则跳过
 #   KNOWN_URLS    已知来源 URL，逗号分隔；其中出现过的 IP 视为非新增
 #   MAX_SEEDS     每轮最多用多少个种子（按 /24 去重后），默认 200
+#   OTX_TIMEOUT   OTX 单次请求超时秒数，默认 60（passive_dns 常要 40s 左右）
+#   OTX_BUDGET    本轮花在 OTX 上的总秒数上限，默认 1500；超了或冷却等不起就停用 OTX
 #   OTX_API_KEY   AlienVault OTX 的免费 API key（可选；不填也能用，但很快会被 429 限流）
 
 import concurrent.futures as cf
@@ -27,6 +29,8 @@ import ipaddress
 import json
 import os
 import re
+import datetime
+import email.utils
 import socket
 import ssl
 import sys
@@ -45,6 +49,8 @@ CHECK_API = os.environ.get("CHECK_API", "").strip()
 KNOWN_URLS = [u.strip() for u in os.environ.get("KNOWN_URLS", "").split(",") if u.strip()]
 MAX_SEEDS = int(os.environ.get("MAX_SEEDS", "200"))
 OTX_API_KEY = os.environ.get("OTX_API_KEY", "").strip()
+OTX_TIMEOUT = float(os.environ.get("OTX_TIMEOUT", "60"))
+OTX_BUDGET = float(os.environ.get("OTX_BUDGET", "1500"))
 
 DOH_URL = "https://dns.google/resolve"
 CF_IPS_URL = "https://www.cloudflare.com/ips-v4/"
@@ -163,19 +169,61 @@ def clean_domains(names):
     return out
 
 
+class OtxStopped(Exception):
+    """OTX 要求的冷却超过本轮预算，或预算已用完：本轮不再查 OTX。"""
+
+
+_otx_state = {"deadline": None, "stopped": None}
+
+
+def retry_after_seconds(value, now=None):
+    """解析 Retry-After：秒数或 HTTP-date；无法解析返回 None。"""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return max(0.0, (when - now).total_seconds())
+
+
+def _otx_remaining():
+    if _otx_state["deadline"] is None:
+        _otx_state["deadline"] = time.monotonic() + OTX_BUDGET
+    return _otx_state["deadline"] - time.monotonic()
+
+
+def _otx_stop(reason):
+    if not _otx_state["stopped"]:
+        _otx_state["stopped"] = reason
+        log(f"OTX 本轮停用：{reason}")
+    raise OtxStopped(reason)
+
+
 def reverse_otx(ip):
+    if _otx_state["stopped"]:
+        raise OtxStopped(_otx_state["stopped"])
+    if _otx_remaining() <= 0:
+        _otx_stop(f"超过预算 {OTX_BUDGET}s")
     headers = {"X-OTX-API-KEY": OTX_API_KEY} if OTX_API_KEY else {}
     url = f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/passive_dns"
     for attempt in range(4):
         _limits["otx"].wait()
-        r = session.get(url, headers=headers, timeout=30)
+        r = session.get(url, headers=headers, timeout=OTX_TIMEOUT)
         if r.status_code not in (429, 502, 503, 504):
             break
-        # 限流或 OTX 网关超时：按 Retry-After 退避，同时把后续请求的间隔拉长
-        try:
-            wait = min(float(r.headers.get("Retry-After", "")), 120.0)
-        except ValueError:
+        # 限流或网关超时：按服务端给的 Retry-After 等满；等不起就停用 OTX，不提前重试
+        wait = retry_after_seconds(r.headers.get("Retry-After"))
+        if wait is None:
             wait = 15.0 * (attempt + 1)
+        if wait > _otx_remaining():
+            _otx_stop(f"HTTP {r.status_code}，要求等待 {int(wait)}s，超过剩余预算")
         _limits["otx"].interval = min(_limits["otx"].interval * 2, 10.0)
         time.sleep(wait)
     r.raise_for_status()
@@ -202,19 +250,29 @@ def reverse_ipchaxun(ip):
 REVERSE_SOURCES = {"otx": reverse_otx, "ip138": reverse_ip138, "ipchaxun": reverse_ipchaxun}
 
 
+def _run_source(name, fn, ip):
+    try:
+        return name, fn(ip)
+    except OtxStopped:
+        return name, "skipped"
+    except Exception as e:
+        return name, f"err:{type(e).__name__}"
+
+
 def reverse_lookup(ip):
+    """三个源并行查同一个种子（各自限速），结果取并集。"""
     domains, stats = set(), {}
-    for name, fn in REVERSE_SOURCES.items():
-        try:
-            got = fn(ip)
-            stats[name] = len(got)
-            domains |= got
-        except Exception as e:
-            stats[name] = f"err:{type(e).__name__}"
+    with cf.ThreadPoolExecutor(len(REVERSE_SOURCES)) as ex:
+        futs = [ex.submit(_run_source, n, fn, ip) for n, fn in REVERSE_SOURCES.items()]
+        for f in futs:
+            name, got = f.result()
+            if isinstance(got, set):
+                stats[name] = len(got)
+                domains |= got
+            else:
+                stats[name] = got
     return ip, domains, stats
 
-
-# ---------- 解析 ----------
 
 def doh_a(domain):
     for attempt in range(3):
@@ -246,6 +304,16 @@ def asn_of(ip):
 _ctx = ssl.create_default_context()
 
 
+def parse_trace(buf):
+    """只接受 2xx 响应里的 colo。"""
+    head, _, body = buf.partition(b"\r\n\r\n")
+    m = re.match(rb"HTTP/\d(?:\.\d)? (\d{3})", head)
+    if not m or not 200 <= int(m.group(1)) < 300:
+        return None
+    m = re.search(rb"(?m)^colo=([A-Z]{3})\s*$", body)
+    return m.group(1).decode() if m else None
+
+
 def trace(ip, host=VERIFY_HOST, timeout=6):
     """TLS(SNI=host, 校验证书) 连 ip:443，GET /cdn-cgi/trace，返回 colo 或 None。"""
     try:
@@ -260,8 +328,7 @@ def trace(ip, host=VERIFY_HOST, timeout=6):
                     if not chunk:
                         break
                     buf += chunk
-        m = re.search(rb"\bcolo=([A-Z]{3})", buf)
-        return m.group(1).decode() if m else None
+        return parse_trace(buf)
     except Exception:
         return None
 
@@ -271,6 +338,8 @@ def check_proxyip(ip):
         return None
     try:
         r = session.get(CHECK_API, params={"proxyip": f"{ip}:443"}, timeout=30)
+        if not r.ok:
+            return None
         j = r.json()
         if not j.get("success"):
             return None
@@ -304,9 +373,9 @@ def main():
     cf_nets = load_cf_networks()
     known = load_known()
 
-    # 1. 反查（三个源各自限速，种子之间并发 3）
+    # 1. 反查（每个种子三源并行、各自限速；种子之间并发 8，OTX 慢所以要并发）
     domains, per_seed = set(), {}
-    with cf.ThreadPoolExecutor(3) as ex:
+    with cf.ThreadPoolExecutor(8) as ex:
         for ip, doms, stats in ex.map(reverse_lookup, seeds):
             per_seed[ip] = stats
             domains |= doms

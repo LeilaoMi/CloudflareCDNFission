@@ -42,6 +42,8 @@ CHECK_API=https://your-checker/check python Fission.py
 | `KNOWN_URLS` | 空 | 已知来源 URL，逗号分隔，用于去重 |
 | `MAX_SEEDS` | `200` | 每轮最多用多少个种子 |
 | `OTX_API_KEY` | 空 | OTX 免费 key；不填会很快被 429 限流，自动退避但会变慢、少查 |
+| `OTX_TIMEOUT` | `60` | OTX 单次超时秒数（passive_dns 常要 40s 左右） |
+| `OTX_BUDGET` | `1500` | 本轮花在 OTX 上的总秒数；超了或冷却等不起就停用 OTX，其他源照跑 |
 
 注意：在有 HTTP 代理的环境里，ip138 / ipchaxun 可能拒绝代理连接，需要直连。
 
