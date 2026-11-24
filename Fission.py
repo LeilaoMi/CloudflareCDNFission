@@ -1,326 +1,370 @@
-# CloudflareCDNFission -- Route C 最小改造（2026-11-25）
+# CloudflareCDNFission -- 裂变扩源 + 验证（2026-11-25 改造）
 #
-# 改动（只改裂变候选池的产出质量，不加验证层）：
-#   1. 域名 -> IP 改用 DoH（dns.google）代替本地 nslookup 子进程。
-#      沙箱 / 容器里的本地 DNS 常被合成，nslookup 在那种环境下会返回
-#      198.18.0.0/15 这类不可路由地址；DoH 直接问公开解析器，结果可复现。
-#   2. 先滤再验：IP 写回 Fission_ip.txt 之前先过两道过滤 --
-#      (a) Cloudflare 官方 IPv4 段（下面 CF_IPV4_RANGES）；
-#      (b) ASN 13335 / 209242（Cloudflare 自身 ASN），用 Team Cymru 的
-#          DNS ASN 查询（同样走 DoH，不新增依赖），收集全部 origin ASN，
-#          任一命中即丢弃。
-#      查不到 ASN 时不丢弃该 IP（宁可留给下游验证器判，不静默丢数），
-#      只有确认为 13335 / 209242 时才丢弃。过滤结果会打印计数。
-#   3. 反查站点只留 ip138 与 ipchaxun，删掉已死的 dnsdblookup
-#      （2026-11-25 实测：dnsdblookup.com 15 秒超时，0 字节）。
-#      两个站的请求改为串行 + 每次间隔至少 1 秒，失败自动换站重试，
-#      两站都失败返回空列表，不抛异常中断整批。反查请求不走适配器
-#      自动重试（否则内部重试会绕过 1 秒间隔），DoH 仍保留重试。
-#   4. 去掉 fake_useragent（它启动时要拉远程 UA 列表），改用固定 UA。
+# 一轮流程：
+#   种子 IP（seeds.txt，可直接放 FOFA 导出的 CSV）
+#     -> 反查同 IP 域名（AlienVault OTX passive DNS + ip138 + ipchaxun，取并集）
+#     -> DoH 解析回 IPv4
+#     -> 丢掉 Cloudflare 公开段、私网/保留地址、种子本身、已知来源里已有的 IP
+#     -> 验证：TLS(SNI=VERIFY_HOST) + GET /cdn-cgi/trace，拿到 colo 才算活
+#     -> 打标签：cf-asn（CF ASN 代播，只能当优选）/ proxyip-XX（过 ProxyIP 检测，XX=出口国家）/ relay
+#     -> 输出 output/alive.txt（ip:443#标签-colo），活 IP 另写 output/seeds_next.txt
 #
-# 不做的事：不加延迟 / TLS / SNI 验证层，不改输出文件名，
-# 不碰 Fission_ip.txt 之外的任何文件。候选池仍只是候选池，
-# 能不能当 ProxyIP 用，由下游的 checker / Globalping 说了算。
-# 本文件在沙箱里没有被执行过（安全策略：不直接运行 fork 代码），
-# 请以 CodeRabbit 审查 + 审阅者的人工阅读为准。
+# 与原版的区别：
+#   * 候选和种子分开：未验证的 IP 不回灌成下一轮种子（原版越跑越多的大多是死 IP）。
+#   * CF ASN（13335 / 209242）不再丢弃，改成标签：这类 IP 当优选入口实测可用，只是不能当 ProxyIP。
+#   * 反查源取并集，OTX 走 JSON API，ip138 / ipchaxun 抓页面，按站限速。
+#   * 不做全网扫描，只验证裂变出的候选。
+#
+# 环境变量：
+#   VERIFY_HOST   验证用 SNI / Host，默认 speed.cloudflare.com（可换成自己的 Worker 域名）
+#   CHECK_API     ProxyIP 检测接口，形如 https://example.com/check（调用 ?proxyip=ip:443），留空则跳过
+#   KNOWN_URLS    已知来源 URL，逗号分隔；其中出现过的 IP 视为非新增
+#   MAX_SEEDS     每轮最多用多少个种子（按 /24 去重后），默认 200
+#   OTX_API_KEY   AlienVault OTX 的免费 API key（可选；不填也能用，但很快会被 429 限流）
 
-# 标准库
-import concurrent.futures
+import concurrent.futures as cf
 import ipaddress
+import json
 import os
+import re
+import socket
+import ssl
+import sys
 import threading
 import time
 
-# 第三方库
 import requests
 from lxml import etree
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# 文件配置
-ips = "Fission_ip.txt"
-domains = "Fission_domain.txt"
-dns_result = "dns_result.txt"
+SEEDS_FILE = "seeds.txt"
+KNOWN_FILE = "known.txt"
+OUT_DIR = "output"
 
-# 并发数配置（反查站点从 20 降到 5；DoH 解析 10，解析器是公开服务不是被爬站点）
-max_workers_request = 5    # 并发反查请求数量
-max_workers_doh = 10       # 并发 DoH 查询数量
+VERIFY_HOST = os.environ.get("VERIFY_HOST", "speed.cloudflare.com")
+CHECK_API = os.environ.get("CHECK_API", "").strip()
+KNOWN_URLS = [u.strip() for u in os.environ.get("KNOWN_URLS", "").split(",") if u.strip()]
+MAX_SEEDS = int(os.environ.get("MAX_SEEDS", "200"))
+OTX_API_KEY = os.environ.get("OTX_API_KEY", "").strip()
 
-# 反查站点之间的最小间隔（秒），两个站共用一把锁，串行请求
-MIN_INTERVAL_PER_SITE = 1.0
-_site_lock = threading.Lock()
-
-# DoH 解析器（与 preferred-sub-generator 的 cmliu-dns 来源同一路）
 DOH_URL = "https://dns.google/resolve"
-
-# Cloudflare 官方 IPv4 段（https://www.cloudflare.com/ips/ 公开清单）
-# 只是过滤“已知的 CF 边缘 IP”，不是优选 IP 的白名单；清单若有新增需同步更新。
-CF_IPV4_RANGES = [
+CF_IPS_URL = "https://www.cloudflare.com/ips-v4/"
+CF_IPV4_FALLBACK = [
     "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
     "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
     "131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15",
     "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
     "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
 ]
-_CF_NETWORKS = [ipaddress.ip_network(c) for c in CF_IPV4_RANGES]
-
-# Cloudflare 自身 ASN：13335（主）/ 209242（Cloudflare London）
 CF_ASNS = {13335, 209242}
 
-# 反查网站配置：dnsdblookup 已死（2026-11-25 实测超时），删掉
-sites_config = {
-    "site_ip138": {
-        "url": "https://site.ip138.com/",
-        "xpath": '//ul[@id="list"]/li/a'
-    },
-    "ipchaxun": {
-        "url": "https://ipchaxun.com/",
-        "xpath": '//div[@id="J_domain"]/p/a'
-    }
-}
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
-# 固定 UA：不再用 fake_useragent 拉远程 UA 列表
-USER_AGENT = "Mozilla/5.0 (compatible; CloudflareCDNFission/route-c)"
+session = requests.Session()
+session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
 
 
-# 设置会话
-# retries_total=0 时适配器不自动重试：反查请求失败要直接进入限速换站
-# 路径，而不是在 session.get() 内部重试、绕过 1 秒间隔。DoH 用默认值 5。
-def setup_session(retries_total=5):
-    session = requests.Session()
-    retries = Retry(total=retries_total, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
+# ---------- 工具 ----------
+
+def log(*a):
+    print(*a, flush=True)
 
 
-# 生成请求头
-def get_headers():
-    return {
-        'User-Agent': USER_AGENT,
-        'Accept': '*/*',
-        'Connection': 'keep-alive',
-    }
-
-
-# 查询域名的函数，自动重试和切换网站（两站都失败返回空列表）
-def fetch_domains_for_ip(ip_address, session, attempts=0, used_sites=None):
-    print(f"Fetching domains for {ip_address}...")
-    if used_sites is None:
-        used_sites = []
-    if attempts >= len(sites_config):  # 每个站最多试一次
+def read_ips(path):
+    """从任意文本（含 FOFA CSV）里抽 IPv4，保持首次出现顺序。"""
+    if not os.path.exists(path):
         return []
+    seen, out = set(), []
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        for ip in IPV4_RE.findall(f.read()):
+            if ip not in seen:
+                seen.add(ip)
+                out.append(ip)
+    return out
 
-    # 选择一个未使用的网站进行查询
-    available_sites = {key: value for key, value in sites_config.items() if key not in used_sites}
-    if not available_sites:
-        return []
 
-    # 固定按字典顺序取站，不再随机挑：行为可复现，出问题先查 ip138
-    site_key = sorted(available_sites.keys())[0]
-    site_info = available_sites[site_key]
-    used_sites.append(site_key)
+def dedupe_by_24(ips):
+    seen, out = set(), []
+    for ip in ips:
+        key = ip.rsplit(".", 1)[0]
+        if key not in seen:
+            seen.add(key)
+            out.append(ip)
+    return out
 
+
+def is_public(ip):
     try:
-        # 串行 + 限速：同一时间只有一个反查请求在跑，间隔至少 1 秒
-        with _site_lock:
-            time.sleep(MIN_INTERVAL_PER_SITE)
-            url = f"{site_info['url']}{ip_address}/"
-            headers = get_headers()
-            response = session.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            html_content = response.text
-
-        parser = etree.HTMLParser()
-        tree = etree.fromstring(html_content, parser)
-        a_elements = tree.xpath(site_info['xpath'])
-        found = [a.text.strip().lower() for a in a_elements
-                 if a.text and a.text.strip() and '.' in a.text.strip()]
-
-        if found:
-            print(f"succeed to fetch domains for {ip_address} from {site_info['url']}")
-            return found
-        raise Exception("No domains found")
-
-    except Exception as e:
-        print(f"Error fetching domains for {ip_address} from {site_info['url']}: {e}")
-        return fetch_domains_for_ip(ip_address, session, attempts + 1, used_sites)
-
-
-# 并发处理所有IP地址
-def fetch_domains_concurrently(ip_addresses):
-    # 反查会话关闭适配器自动重试：失败直接换站，内部重试会绕过 1 秒限速
-    session = setup_session(retries_total=0)
-    domains = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_request) as executor:
-        future_to_ip = {executor.submit(fetch_domains_for_ip, ip, session): ip for ip in ip_addresses}
-        for future in concurrent.futures.as_completed(future_to_ip):
-            domains.extend(future.result())
-
-    return list(set(domains))
-
-
-# DoH 查询单个域名，返回它的 A 记录 IP 列表（代替原来的 nslookup 子进程）
-def doh_lookup(domain, session):
-    try:
-        response = session.get(DOH_URL, params={"name": domain, "type": "A"}, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("Status") != 0:
-            return domain, []
-        ips = [a["data"] for a in data.get("Answer", [])
-               if a.get("type") == 1 and a.get("data")]
-        return domain, ips
-    except Exception as e:
-        print(f"Error DoH lookup for {domain}: {e}")
-        return domain, []
-
-
-# Team Cymru DNS ASN 查询（走 DoH）：返回全部 origin ASN 的集合，查不到返回 None
-# 同一前缀可能有多个 origin ASN（首字段为空格分隔的列表），同一地址也可能
-# 返回多条 TXT 答案；只读第一条、只取第一个数字会漏掉 13335 / 209242。
-# 所以遍历全部答案、收集首字段里的全部数字，调用方任一命中即丢弃。
-_asn_cache = {}
-
-def lookup_asns(ip, session):
-    if ip in _asn_cache:
-        return _asn_cache[ip]
-    asns = set()
-    try:
-        reversed_ip = '.'.join(reversed(ip.split('.')))
-        response = session.get(
-            DOH_URL,
-            params={"name": f"{reversed_ip}.origin.asn.cymru.com", "type": "TXT"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
-        for answer in data.get("Answer", []):
-            if answer.get("type") == 16:
-                first_field = answer.get("data", "").strip('"').split("|")[0].strip()
-                for token in first_field.split():
-                    if token.isdigit():
-                        asns.add(int(token))
-    except Exception as e:
-        print(f"Error ASN lookup for {ip}: {e}")
-    result = asns or None
-    _asn_cache[ip] = result
-    return result
-
-
-def is_cloudflare_ip(ip):
-    try:
-        addr = ipaddress.ip_address(ip)
+        return ipaddress.ip_address(ip).is_global
     except ValueError:
-        return True  # 非法地址按 CF 段处理：直接丢弃
-    return any(addr in net for net in _CF_NETWORKS)
+        return False
 
 
-# 先滤再验：公网 IP -> 去 CF 段 -> 去 CF ASN（13335 / 209242）
-# 返回（保留的 IP 集合，各阶段丢弃数），供日志与调用方核对
-def filter_candidate_ips(ip_set, session):
-    kept = set()
-    dropped_non_global = 0
-    dropped_cf_range = 0
-    dropped_cf_asn = 0
-    for ip in sorted(ip_set):
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            dropped_non_global += 1
-            continue
-        if not addr.is_global:
-            dropped_non_global += 1
-            continue
-        if is_cloudflare_ip(ip):
-            dropped_cf_range += 1
-            continue
-        asns = lookup_asns(ip, session)
-        if asns is not None and asns & CF_ASNS:
-            dropped_cf_asn += 1
-            continue
-        kept.add(ip)
-    return kept, dropped_non_global, dropped_cf_range, dropped_cf_asn
-
-
-# 通过域名列表获取绑定过的所有 ip（DoH 版）
-def perform_dns_lookups(domain_filename, result_filename, unique_ipv4_filename):
+def load_cf_networks():
     try:
-        # 读取域名列表
-        with open(domain_filename, 'r') as file:
-            domains = file.read().splitlines()
-
-        session = setup_session()
-
-        # DoH 查询每个域名
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_doh) as executor:
-            results = list(executor.map(lambda d: doh_lookup(d, session), domains))
-
-        # 写入查询结果到文件（格式改为 "域名: ip1, ip2"，不再是 nslookup 原始输出）
-        with open(result_filename, 'w') as output_file:
-            for domain, ips in results:
-                output_file.write(f"{domain}: {', '.join(ips)}\n")
-
-        # 从结果中提取所有 IPv4 地址
-        ipv4_addresses = set()
-        for _, ips in results:
-            ipv4_addresses.update(ips)
-
-        with open(unique_ipv4_filename, 'r') as file:
-            exist_list = {ip.strip() for ip in file}
-
-        # 先滤再验：只把非 CF 段、非 CF ASN 的公网 IP 写回
-        filtered, dropped_non_global, dropped_cf_range, dropped_cf_asn = \
-            filter_candidate_ips(ipv4_addresses, session)
-        print(f"filter: kept {len(filtered)}, dropped non-global {dropped_non_global}, "
-              f"dropped CF range {dropped_cf_range}, dropped CF ASN {dropped_cf_asn}")
-        filtered.update(exist_list)
-
-        # 保存 IP 地址（排序后写回，结果可复现）
-        with open(unique_ipv4_filename, 'w') as output_file:
-            for address in sorted(filtered):
-                output_file.write(address + '\n')
-
+        r = session.get(CF_IPS_URL, timeout=15)
+        r.raise_for_status()
+        nets = [ipaddress.ip_network(l.strip()) for l in r.text.splitlines() if l.strip()]
+        if nets:
+            return nets
     except Exception as e:
-        print(f"Error performing DNS lookups: {e}")
+        log(f"CF 段拉取失败，用内置清单：{e}")
+    return [ipaddress.ip_network(c) for c in CF_IPV4_FALLBACK]
 
 
-# 主函数
+def in_networks(ip, nets):
+    addr = ipaddress.ip_address(ip)
+    return any(addr in n for n in nets)
+
+
+def load_known():
+    known = set(read_ips(KNOWN_FILE))
+    for url in KNOWN_URLS:
+        try:
+            r = session.get(url, timeout=30)
+            r.raise_for_status()
+            got = set(IPV4_RE.findall(r.text))
+            known |= got
+            log(f"已知来源 {url}: {len(got)}")
+        except Exception as e:
+            log(f"已知来源拉取失败 {url}: {e}")
+    return known
+
+
+# ---------- 反查 ----------
+
+class RateLimiter:
+    def __init__(self, interval):
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.last = 0.0
+
+    def wait(self):
+        with self.lock:
+            gap = self.interval - (time.monotonic() - self.last)
+            if gap > 0:
+                time.sleep(gap)
+            self.last = time.monotonic()
+
+
+_limits = {"otx": RateLimiter(1.0), "ip138": RateLimiter(1.0), "ipchaxun": RateLimiter(1.0)}
+
+
+def clean_domains(names):
+    out = set()
+    for n in names:
+        n = (n or "").strip().lower().rstrip(".")
+        if n.startswith("*."):
+            n = n[2:]
+        if DOMAIN_RE.match(n):
+            out.add(n)
+    return out
+
+
+def reverse_otx(ip):
+    headers = {"X-OTX-API-KEY": OTX_API_KEY} if OTX_API_KEY else {}
+    url = f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/passive_dns"
+    for attempt in range(4):
+        _limits["otx"].wait()
+        r = session.get(url, headers=headers, timeout=30)
+        if r.status_code != 429:
+            break
+        # 限流：按 Retry-After 退避，同时把后续请求的间隔拉长
+        try:
+            wait = min(float(r.headers.get("Retry-After", "")), 120.0)
+        except ValueError:
+            wait = 15.0 * (attempt + 1)
+        _limits["otx"].interval = min(_limits["otx"].interval * 2, 10.0)
+        time.sleep(wait)
+    r.raise_for_status()
+    rows = r.json().get("passive_dns", [])
+    return clean_domains(x.get("hostname") for x in rows if x.get("record_type") in (None, "A"))
+
+
+def _scrape(key, url, xpath):
+    _limits[key].wait()
+    r = session.get(url, timeout=20)
+    r.raise_for_status()
+    tree = etree.fromstring(r.text, etree.HTMLParser())
+    return clean_domains(a.text for a in tree.xpath(xpath) if a.text)
+
+
+def reverse_ip138(ip):
+    return _scrape("ip138", f"https://site.ip138.com/{ip}/", '//ul[@id="list"]/li/a')
+
+
+def reverse_ipchaxun(ip):
+    return _scrape("ipchaxun", f"https://ipchaxun.com/{ip}/", '//div[@id="J_domain"]/p/a')
+
+
+REVERSE_SOURCES = {"otx": reverse_otx, "ip138": reverse_ip138, "ipchaxun": reverse_ipchaxun}
+
+
+def reverse_lookup(ip):
+    domains, stats = set(), {}
+    for name, fn in REVERSE_SOURCES.items():
+        try:
+            got = fn(ip)
+            stats[name] = len(got)
+            domains |= got
+        except Exception as e:
+            stats[name] = f"err:{type(e).__name__}"
+    return ip, domains, stats
+
+
+# ---------- 解析 ----------
+
+def doh_a(domain):
+    for attempt in range(3):
+        try:
+            r = session.get(DOH_URL, params={"name": domain, "type": "A"}, timeout=10)
+            r.raise_for_status()
+            return domain, [a["data"] for a in r.json().get("Answer", []) if a.get("type") == 1]
+        except Exception:
+            time.sleep(1 + attempt)
+    return domain, []
+
+
+def asn_of(ip):
+    rev = ".".join(reversed(ip.split(".")))
+    try:
+        r = session.get(DOH_URL, params={"name": f"{rev}.origin.asn.cymru.com", "type": "TXT"}, timeout=10)
+        r.raise_for_status()
+        asns = set()
+        for a in r.json().get("Answer", []):
+            first = a.get("data", "").strip('"').split("|")[0]
+            asns |= {int(t) for t in first.split() if t.isdigit()}
+        return asns
+    except Exception:
+        return set()
+
+
+# ---------- 验证 ----------
+
+_ctx = ssl.create_default_context()
+
+
+def trace(ip, host=VERIFY_HOST, timeout=6):
+    """TLS(SNI=host, 校验证书) 连 ip:443，GET /cdn-cgi/trace，返回 colo 或 None。"""
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout) as raw:
+            with _ctx.wrap_socket(raw, server_hostname=host) as s:
+                s.settimeout(timeout)
+                s.sendall(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\n"
+                          f"User-Agent: {USER_AGENT}\r\nConnection: close\r\n\r\n".encode())
+                buf = b""
+                while len(buf) < 8192:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+        m = re.search(rb"\bcolo=([A-Z]{3})", buf)
+        return m.group(1).decode() if m else None
+    except Exception:
+        return None
+
+
+def check_proxyip(ip):
+    if not CHECK_API:
+        return None
+    try:
+        r = session.get(CHECK_API, params={"proxyip": f"{ip}:443"}, timeout=30)
+        j = r.json()
+        if not j.get("success"):
+            return None
+        exit_ = (j.get("probe_results", {}).get("ipv4") or {}).get("exit") or {}
+        return exit_.get("country") or "XX"
+    except Exception:
+        return None
+
+
+def classify(ip, colo, asns, proxy_country):
+    if asns & CF_ASNS:
+        tag = "cf-asn"
+    elif proxy_country:
+        tag = f"proxyip-{proxy_country}"
+    else:
+        tag = "relay"
+    return f"{ip}:443#{tag}-{colo}"
+
+
+# ---------- 主流程 ----------
+
 def main():
-    # 判断是否存在 IP 文件
-    if not os.path.exists(ips):
-        with open(ips, 'w') as file:
-            file.write("")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    seeds_all = [ip for ip in read_ips(SEEDS_FILE) if is_public(ip)]
+    seeds = dedupe_by_24(seeds_all)[:MAX_SEEDS]
+    if not seeds:
+        log(f"{SEEDS_FILE} 里没有可用种子（可直接放 FOFA 导出的 CSV）")
+        return 1
+    log(f"种子 {len(seeds_all)}，按 /24 去重后用 {len(seeds)}")
 
-    # 判断是否存在域名文件
-    if not os.path.exists(domains):
-        with open(domains, 'w') as file:
-            file.write("")
+    cf_nets = load_cf_networks()
+    known = load_known()
 
-    # IP 反查域名
-    with open(ips, 'r') as ips_txt:
-        ip_list = [ip.strip() for ip in ips_txt if ip.strip()]
+    # 1. 反查（三个源各自限速，种子之间并发 3）
+    domains, per_seed = set(), {}
+    with cf.ThreadPoolExecutor(3) as ex:
+        for ip, doms, stats in ex.map(reverse_lookup, seeds):
+            per_seed[ip] = stats
+            domains |= doms
+    log(f"反查域名 {len(domains)}")
 
-    domain_list = fetch_domains_concurrently(ip_list)
-    print("域名列表为")
-    print(domain_list)
-    with open("Fission_domain.txt", "r") as file:
-        exist_list = [domain.strip() for domain in file if domain.strip()]
+    # 2. DoH 解析
+    resolved = {}
+    with cf.ThreadPoolExecutor(16) as ex:
+        for d, ips in ex.map(doh_a, sorted(domains)):
+            resolved[d] = ips
+    all_ips = {ip for ips in resolved.values() for ip in ips}
 
-    domain_list = list(set(domain_list + exist_list))
+    # 3. 过滤
+    seed_set = set(seeds_all)
+    stats = {"resolved_ips": len(all_ips)}
+    cands = []
+    for ip in sorted(all_ips):
+        if not is_public(ip) or ip in seed_set:
+            continue
+        if in_networks(ip, cf_nets):
+            stats["cf_range"] = stats.get("cf_range", 0) + 1
+            continue
+        if ip in known:
+            stats["known"] = stats.get("known", 0) + 1
+            continue
+        cands.append(ip)
+    stats["new_candidates"] = len(cands)
+    log(f"过滤：{stats}")
 
-    with open("Fission_domain.txt", "w") as output:
-        for domain in sorted(domain_list):
-            output.write(domain + "\n")
-    print("IP -> 域名 已完成")
+    # 4. 验证
+    alive = {}
+    with cf.ThreadPoolExecutor(32) as ex:
+        for ip, colo in zip(cands, ex.map(trace, cands)):
+            if colo:
+                alive[ip] = colo
+    stats["alive"] = len(alive)
 
-    # 域名解析 IP（DoH + 先滤再验）
-    perform_dns_lookups(domains, dns_result, ips)
-    print("域名 -> IP 已完成")
+    lines = []
+    with cf.ThreadPoolExecutor(8) as ex:
+        ips = sorted(alive)
+        asn_list = list(ex.map(asn_of, ips))
+        proxy_list = list(ex.map(lambda i, a: None if a & CF_ASNS else check_proxyip(i), ips, asn_list))
+    for ip, asns, pc in zip(ips, asn_list, proxy_list):
+        lines.append(classify(ip, alive[ip], asns, pc))
+    stats["proxyip"] = sum(1 for l in lines if "#proxyip-" in l)
+    log(f"验证：活 {stats['alive']}，ProxyIP 可用 {stats['proxyip']}")
+
+    with open(f"{OUT_DIR}/candidates.txt", "w") as f:
+        f.write("\n".join(cands) + ("\n" if cands else ""))
+    with open(f"{OUT_DIR}/alive.txt", "w") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+    with open(f"{OUT_DIR}/seeds_next.txt", "w") as f:
+        f.write("\n".join(sorted(alive)) + ("\n" if alive else ""))
+    with open(f"{OUT_DIR}/report.json", "w") as f:
+        json.dump({"verify_host": VERIFY_HOST, "seeds_used": len(seeds), "domains": len(domains),
+                   "stats": stats, "per_seed": per_seed}, f, ensure_ascii=False, indent=1)
+    return 0
 
 
-# 程序入口
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
