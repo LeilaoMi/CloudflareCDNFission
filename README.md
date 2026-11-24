@@ -30,7 +30,7 @@
 ## 本地运行
 
 ```bash
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.txt
 # seeds.txt 放种子；可选 known.txt 放已知 IP 用于去重
 CHECK_API=https://your-checker/check python Fission.py
 ```
