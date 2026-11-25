@@ -274,8 +274,14 @@ def reverse_lookup(ip):
     return ip, domains, stats
 
 
+DOH_DEADLINE = float(os.environ.get("DOH_DEADLINE", "1200"))  # DoH 阶段最多花多少秒
+_doh_stop = [float("inf")]
+
+
 def doh_a(domain):
     for attempt in range(3):
+        if time.monotonic() > _doh_stop[0]:
+            break
         try:
             r = session.get(DOH_URL, params={"name": domain, "type": "A"}, timeout=10)
             r.raise_for_status()
@@ -400,6 +406,7 @@ def main():
                 per_seed[ip] = st
                 domains |= doms
         log(f"反查域名 {len(domains)}")
+        _doh_stop[0] = time.monotonic() + DOH_DEADLINE
         with cf.ThreadPoolExecutor(16) as ex:
             for _, ips in ex.map(doh_a, sorted(domains)):
                 fission_ips.update(ip for ip in ips if keep(ip))
@@ -408,8 +415,10 @@ def main():
     old = {ip for ip in read_ips(IPS_FILE) if keep(ip)}
     found = netlas_ips | fission_ips | {ip for ip in seeds_all if keep(ip)}
     merged = sorted(old | found, key=ipaddress.ip_address)
-    with open(IPS_FILE, "w") as f:
+    tmp = IPS_FILE + ".tmp"
+    with open(tmp, "w") as f:
         f.write("\n".join(merged) + ("\n" if merged else ""))
+    os.replace(tmp, IPS_FILE)
     save_netlas_state(netlas_state)  # 结果落盘后再推进 Netlas 进度
     stats = {"netlas": netlas_stats, "seeds_used": len(seeds), "domains": len(domains),
              "netlas_ips": len(netlas_ips), "fission_ips": len(fission_ips),
