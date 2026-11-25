@@ -19,7 +19,7 @@
 ## 一轮做什么
 
 1. **Netlas**（有 `NETLAS_API_KEY` 时）：查询 `http.headers.server:"cloudflare" AND port:443 AND http.status_code:403 AND geo.country:US AND host_type:ip`。免费版单次最多 200 条，所以按 IP 段对半切片，段内 ≤200 条就整段下载；进度存 `netlas_state.json`，每轮最多 `NETLAS_MAX_REQUESTS` 次请求，几天轮完一遍后从头再来。
-2. **种子**：`seeds.txt` + secret `FISSION_SEEDS`（一行一个 IP，或直接贴 FOFA CSV）+ 本轮 Netlas 拿到的 IP，按 /24 去重。
+2. **种子**：`seeds.txt`（本地运行时自己建，一行一个 IP 或直接放 FOFA CSV）+ secret `FISSION_SEEDS`（仅 Actions，会追加进 `seeds.txt`）+ 本轮 Netlas 拿到的 IP，按 /24 去重。
 3. **裂变**：反查同 IP 绑定过的域名（AlienVault OTX passive DNS + site.ip138.com + ipchaxun.com，取并集），再经 DoH（dns.google）解析回 IPv4。
 4. **过滤合并**：剔除 Cloudflare 官方段、私网 / 保留地址，并进 `output/ips.txt`。
 
@@ -29,13 +29,14 @@
 
 - Secret `NETLAS_API_KEY`（推荐）：netlas.io 免费注册，Community 版约 50 次请求/天。
 - Secret `OTX_API_KEY`（推荐）：otx.alienvault.com 免费注册；不填很快会被 429 限流。
-- Secret `FISSION_SEEDS`（可选）：额外种子。
+- Secret `FISSION_SEEDS`（可选，仅 Actions）：额外种子。注意：种子本身也会写进公开的 `output/ips.txt`，只填可以公开的地址。
 - Variable `NETLAS_QUERY`（可选）：换查询语句（换了会从头切片）。
 
 ## 本地运行
 
 ```bash
 pip install --require-hashes -r requirements.txt
+# 种子写进 seeds.txt（可选）
 NETLAS_API_KEY=... OTX_API_KEY=... python Fission.py
 ```
 
@@ -44,6 +45,7 @@ NETLAS_API_KEY=... OTX_API_KEY=... python Fission.py
 | `NETLAS_API_KEY` | 空（跳过 Netlas） | Netlas key |
 | `NETLAS_QUERY` | 见上 | Netlas 查询 |
 | `NETLAS_MAX_REQUESTS` | `45` | 每轮最多调 Netlas 多少次 |
+| `NETLAS_DEADLINE` | `900` | Netlas 阶段最多花多少秒，到点就停并保存进度 |
 | `MAX_SEEDS` | `200` | 每轮最多裂变多少个种子，`0` = 不裂变 |
 | `OTX_API_KEY` | 空 | OTX key |
 | `OTX_TIMEOUT` | `60` | OTX 单次超时秒数 |

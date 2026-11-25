@@ -47,6 +47,7 @@ NETLAS_MAX_REQUESTS = int(os.environ.get("NETLAS_MAX_REQUESTS", "45"))
 NETLAS_API = "https://app.netlas.io/api"
 NETLAS_PAGE = 200          # 免费版单次下载上限
 NETLAS_MIN_PREFIX = 24     # 切到 /24 还超就只拿前 200 条
+NETLAS_DEADLINE = float(os.environ.get("NETLAS_DEADLINE", "900"))  # Netlas 阶段最多花多少秒
 MAX_SEEDS = int(os.environ.get("MAX_SEEDS", "200"))
 OTX_API_KEY = os.environ.get("OTX_API_KEY", "").strip()
 OTX_TIMEOUT = float(os.environ.get("OTX_TIMEOUT", "60"))
@@ -102,7 +103,8 @@ def dedupe_by_24(ips):
 
 def is_public(ip):
     try:
-        return ipaddress.ip_address(ip).is_global
+        addr = ipaddress.ip_address(ip)
+        return addr.version == 4 and addr.is_global and not addr.is_multicast
     except ValueError:
         return False
 
@@ -158,7 +160,8 @@ class OtxStopped(Exception):
     """OTX 要求的冷却超过本轮预算，或预算已用完：本轮不再查 OTX。"""
 
 
-_otx_state = {"deadline": None, "stopped": None}
+_otx_state = {"deadline": None, "stopped": None, "cooldown_until": 0.0}
+_otx_lock = threading.Lock()
 
 
 def retry_after_seconds(value, now=None):
@@ -200,7 +203,17 @@ def reverse_otx(ip):
     url = f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/passive_dns"
     for attempt in range(4):
         _limits["otx"].wait()
-        r = session.get(url, headers=headers, timeout=OTX_TIMEOUT)
+        # 所有线程共用同一个冷却截止时间；等待后再查一次预算
+        cool = _otx_state["cooldown_until"] - time.monotonic()
+        if cool > 0:
+            if cool > _otx_remaining():
+                _otx_stop(f"冷却还需 {int(cool)}s，超过剩余预算")
+            time.sleep(cool)
+        if _otx_state["stopped"]:
+            raise OtxStopped(_otx_state["stopped"])
+        if _otx_remaining() <= 0:
+            _otx_stop(f"超过预算 {OTX_BUDGET}s")
+        r = session.get(url, headers=headers, timeout=min(OTX_TIMEOUT, max(1.0, _otx_remaining())))
         if r.status_code not in (429, 502, 503, 504):
             break
         # 限流或网关超时：按服务端给的 Retry-After 等满；等不起就停用 OTX，不提前重试
@@ -209,8 +222,8 @@ def reverse_otx(ip):
             wait = 15.0 * (attempt + 1)
         if wait > _otx_remaining():
             _otx_stop(f"HTTP {r.status_code}，要求等待 {int(wait)}s，超过剩余预算")
-        _limits["otx"].interval = min(_limits["otx"].interval * 2, 10.0)
-        time.sleep(wait)
+        with _otx_lock:
+            _otx_state["cooldown_until"] = max(_otx_state["cooldown_until"], time.monotonic() + wait)
     r.raise_for_status()
     rows = r.json().get("passive_dns", [])
     return clean_domains(x.get("hostname") for x in rows if x.get("record_type") in (None, "A"))
@@ -294,49 +307,69 @@ def load_netlas_state():
             return st
     except (OSError, ValueError):
         pass
-    return {"query": NETLAS_QUERY, "queue": ["0.0.0.0/0"], "cycles_done": 0}
+    return {"query": NETLAS_QUERY, "queue": ["0.0.0.0/0"], "cycles_done": 0, "pending": None}
+
+
+def save_netlas_state(st):
+    if st is None:
+        return
+    with open(NETLAS_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+
+
+def netlas_slice_query(cidr):
+    return f'({NETLAS_QUERY}) AND ip:"{cidr}"'
 
 
 def collect_netlas():
-    """按 IP 段切片：段内 <=200 条就整段下载，否则对半切再排队。返回本轮拿到的 IPv4 集合。"""
+    """按 IP 段切片：段内 <=200 条就整段下载，否则对半切再排队。
+
+    返回 (本轮 IPv4 集合, 统计, 新状态)。状态由调用方在结果写盘后保存。
+    已数过但没来得及下载的切片记在 pending，下轮直接下载。
+    """
     if not NETLAS_API_KEY or NETLAS_MAX_REQUESTS <= 0:
-        return set(), {"skipped": True}
+        return set(), {"skipped": True}, None
     st = load_netlas_state()
-    got, used, stats = set(), 0, {"count_calls": 0, "downloads": 0, "slices_done": 0}
-    while used < NETLAS_MAX_REQUESTS:
-        if not st["queue"]:
-            st["queue"] = ["0.0.0.0/0"]
-            st["cycles_done"] = st.get("cycles_done", 0) + 1
-            break
-        cidr = st["queue"][0]
-        q = f'{NETLAS_QUERY} AND ip:"{cidr}"'
+    st.setdefault("pending", None)
+    got, used = set(), 0
+    stats = {"count_calls": 0, "downloads": 0, "slices_done": 0}
+    stop_at = time.monotonic() + NETLAS_DEADLINE
+    while used < NETLAS_MAX_REQUESTS and time.monotonic() < stop_at:
         try:
-            n = _netlas("GET", "/responses_count/", params={"q": q})["count"]
-            used += 1
-            stats["count_calls"] += 1
-            if n > NETLAS_PAGE and ipaddress.ip_network(cidr).prefixlen < NETLAS_MIN_PREFIX:
-                st["queue"] = split_cidr(cidr) + st["queue"][1:]
-                continue
-            if n and used < NETLAS_MAX_REQUESTS:
-                body = {"q": q, "fields": ["ip"], "source_type": "include",
+            if st["pending"]:
+                cidr, n = st["pending"]["cidr"], st["pending"]["count"]
+                body = {"q": netlas_slice_query(cidr), "fields": ["ip"], "source_type": "include",
                         "size": min(n, NETLAS_PAGE), "type": "json", "indices": ""}
                 rows = _netlas("POST", "/responses/download/", json=body)
                 used += 1
                 stats["downloads"] += 1
                 got |= {r.get("data", {}).get("ip") for r in rows} - {None}
-            elif n:
-                break  # 预算只够数不够下，留到下轮
+                st["pending"] = None
+                stats["slices_done"] += 1
+                continue
+            if not st["queue"]:
+                st["queue"] = ["0.0.0.0/0"]
+                st["cycles_done"] = st.get("cycles_done", 0) + 1
+                break
+            cidr = st["queue"][0]
+            n = _netlas("GET", "/responses_count/", params={"q": netlas_slice_query(cidr)})["count"]
+            used += 1
+            stats["count_calls"] += 1
             st["queue"].pop(0)
-            stats["slices_done"] += 1
+            if n > NETLAS_PAGE and ipaddress.ip_network(cidr).prefixlen < NETLAS_MIN_PREFIX:
+                st["queue"] = split_cidr(cidr) + st["queue"]
+            elif n:
+                st["pending"] = {"cidr": cidr, "count": n}
+            else:
+                stats["slices_done"] += 1
         except Exception as e:
             log(f"Netlas 停止：{e}")
             stats["error"] = str(e)[:200]
             break
-    stats.update(requests=used, ips=len(got), queue_left=len(st["queue"]), cycles_done=st.get("cycles_done", 0))
-    with open(NETLAS_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=1)
+    stats.update(requests=used, ips=len(got), queue_left=len(st["queue"]) + bool(st["pending"]),
+                 cycles_done=st.get("cycles_done", 0))
     log(f"Netlas：{stats}")
-    return {ip for ip in got if IPV4_RE.fullmatch(ip)}, stats
+    return {ip for ip in got if IPV4_RE.fullmatch(ip)}, stats, st
 
 
 # ---------- 主流程 ----------
@@ -349,7 +382,7 @@ def main():
         return is_public(ip) and not in_networks(ip, cf_nets)
 
     # 1. Netlas
-    netlas_ips, netlas_stats = collect_netlas()
+    netlas_ips, netlas_stats, netlas_state = collect_netlas()
     netlas_ips = {ip for ip in netlas_ips if keep(ip)}
 
     # 2. 种子
@@ -370,11 +403,12 @@ def main():
                 fission_ips.update(ip for ip in ips if keep(ip))
 
     # 5. 合并输出（累积去重）
-    old = set(read_ips(IPS_FILE))
+    old = {ip for ip in read_ips(IPS_FILE) if keep(ip)}
     found = netlas_ips | fission_ips | {ip for ip in seeds_all if keep(ip)}
     merged = sorted(old | found, key=ipaddress.ip_address)
     with open(IPS_FILE, "w") as f:
         f.write("\n".join(merged) + ("\n" if merged else ""))
+    save_netlas_state(netlas_state)  # 结果落盘后再推进 Netlas 进度
     stats = {"netlas": netlas_stats, "seeds_used": len(seeds), "domains": len(domains),
              "netlas_ips": len(netlas_ips), "fission_ips": len(fission_ips),
              "new_this_run": len(found - old), "total": len(merged)}

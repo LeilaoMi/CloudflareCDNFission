@@ -70,7 +70,37 @@ def test_collect_netlas_splits_and_downloads(tmp_path, monkeypatch):
         return [{"data": {"ip": "64.1.2.3"}}, {"data": {"ip": "64.1.2.3"}}]
 
     monkeypatch.setattr(F, "_netlas", fake)
-    ips, st = F.collect_netlas()
+    ips, st, state = F.collect_netlas()
     assert ips == {"64.1.2.3"}
     assert st["count_calls"] == 3 and st["downloads"] == 1
+    assert state["pending"] is None
+
+
+def test_collect_netlas_keeps_pending_when_budget_runs_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(F, "NETLAS_STATE_FILE", str(tmp_path / "st.json"))
+    monkeypatch.setattr(F, "NETLAS_API_KEY", "k")
+    monkeypatch.setattr(F, "NETLAS_MAX_REQUESTS", 1)
+    calls = []
+
+    def fake(method, path, **kw):
+        calls.append(path)
+        if path == "/responses_count/":
+            return {"count": 5}
+        return [{"data": {"ip": "64.1.2.3"}}]
+
+    monkeypatch.setattr(F, "_netlas", fake)
+    _, _, state = F.collect_netlas()
+    assert state["pending"] == {"cidr": "0.0.0.0/0", "count": 5}
+    F.save_netlas_state(state)
+    ips, _, state = F.collect_netlas()
+    assert ips == {"64.1.2.3"} and calls == ["/responses_count/", "/responses/download/"]
+
+
+def test_slice_query_is_grouped(monkeypatch):
+    monkeypatch.setattr(F, "NETLAS_QUERY", "port:443 OR port:8443")
+    assert F.netlas_slice_query("1.0.0.0/8") == '(port:443 OR port:8443) AND ip:"1.0.0.0/8"'
+
+
+def test_is_public_rejects_multicast():
+    assert not F.is_public("224.0.0.1")
 

@@ -25,6 +25,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}   # 取分支最新提交，而不是触发时的 SHA
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -46,7 +48,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output/ips.txt output/netlas_state.json output/report.json
+          for f in output/ips.txt output/netlas_state.json output/report.json; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
           if git diff --cached --quiet; then echo "无变化"; exit 0; fi
           git commit -m "data: $(date -u +%F) 更新 IP 列表"
-          git push
+          # 期间分支有更新就变基后重试，不强推（ips.txt 冲突时以本轮结果为准，下轮会再合并累积）
+          for i in 1 2 3; do
+            if git push; then exit 0; fi
+            git pull --rebase -X theirs || { git rebase --abort; exit 1; }
+          done
+          exit 1
