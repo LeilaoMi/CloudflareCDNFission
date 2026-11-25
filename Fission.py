@@ -204,8 +204,10 @@ def reverse_otx(ip):
     for attempt in range(4):
         _limits["otx"].wait()
         # 所有线程共用同一个冷却截止时间；等待后再查一次预算
-        cool = _otx_state["cooldown_until"] - time.monotonic()
-        if cool > 0:
+        while True:
+            cool = _otx_state["cooldown_until"] - time.monotonic()
+            if cool <= 0:
+                break
             if cool > _otx_remaining():
                 _otx_stop(f"冷却还需 {int(cool)}s，超过剩余预算")
             time.sleep(cool)
@@ -339,7 +341,7 @@ def collect_netlas():
             if st["pending"]:
                 cidr, n = st["pending"]["cidr"], st["pending"]["count"]
                 body = {"q": netlas_slice_query(cidr), "fields": ["ip"], "source_type": "include",
-                        "size": min(n, NETLAS_PAGE), "type": "json", "indices": ""}
+                        "size": NETLAS_PAGE, "type": "json", "indices": ""}
                 rows = _netlas("POST", "/responses/download/", json=body)
                 used += 1
                 stats["downloads"] += 1

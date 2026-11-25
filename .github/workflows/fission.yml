@@ -53,9 +53,18 @@ jobs:
           done
           if git diff --cached --quiet; then echo "无变化"; exit 0; fi
           git commit -m "data: $(date -u +%F) 更新 IP 列表"
-          # 期间分支有更新就变基后重试，不强推（ips.txt 冲突时以本轮结果为准，下轮会再合并累积）
+          # 期间分支有更新就变基后重试，不强推（ips.txt 冲突时合并两侧并集）
           for i in 1 2 3; do
             if git push; then exit 0; fi
-            git pull --rebase -X theirs || { git rebase --abort; exit 1; }
+            if ! git pull --rebase; then
+              # 冲突：合并两侧 ips.txt（并集、去重、排序），其余文件取本轮结果
+              if git diff --name-only --diff-filter=U | grep -qvE '^output/(ips\.txt|report\.json|netlas_state\.json)$'; then git rebase --abort; exit 1; fi
+              git show :2:output/ips.txt > /tmp/a.txt 2>/dev/null || true
+              git show :3:output/ips.txt > /tmp/b.txt 2>/dev/null || true
+              cat /tmp/a.txt /tmp/b.txt | grep -E '^[0-9.]+$' | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n > output/ips.txt
+              for f in output/report.json output/netlas_state.json; do git checkout --theirs -- "$f" 2>/dev/null || true; done
+              git add output
+              GIT_EDITOR=true git rebase --continue || { git rebase --abort; exit 1; }
+            fi
           done
           exit 1
