@@ -1,0 +1,75 @@
+name: Fission
+
+on:
+  schedule:
+    - cron: "30 20 * * *"   # 每天北京时间 04:30
+  workflow_dispatch:
+    inputs:
+      max_seeds:
+        description: "最多用多少个种子做裂变（/24 去重后，0 = 只跑 Netlas）"
+        required: false
+        default: "200"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fission
+  cancel-in-progress: false
+
+jobs:
+  fission:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}   # 取分支最新提交，而不是触发时的 SHA
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install --only-binary :all: --require-hashes -r requirements.txt
+      - name: Seeds
+        env:
+          FISSION_SEEDS: ${{ secrets.FISSION_SEEDS }}
+        run: |
+          if [ -n "$FISSION_SEEDS" ]; then printf '%s\n' "$FISSION_SEEDS" >> seeds.txt; fi
+      - name: Run
+        env:
+          NETLAS_API_KEY: ${{ secrets.NETLAS_API_KEY }}
+          OTX_API_KEY: ${{ secrets.OTX_API_KEY }}
+          NETLAS_QUERY: ${{ vars.NETLAS_QUERY }}
+          MAX_SEEDS: ${{ inputs.max_seeds || '200' }}
+        run: python Fission.py
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for f in output/ips.txt output/netlas_state.json output/report.json; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
+          if git diff --cached --quiet; then echo "无变化"; exit 0; fi
+          git commit -m "data: $(date -u +%F) 更新 IP 列表"
+          # 期间分支有更新就变基后重试，不强推（ips.txt 冲突时合并两侧并集）
+          for i in 1 2 3; do
+            if git push; then exit 0; fi
+            if ! git pull --rebase; then
+              # 冲突：合并两侧 ips.txt（并集、去重、排序），其余文件取本轮结果
+              if git diff --name-only --diff-filter=U | grep -qvE '^output/(ips\.txt|report\.json|netlas_state\.json)$'; then git rebase --abort; exit 1; fi
+              if git diff --name-only --diff-filter=U | grep -qx 'output/ips.txt'; then
+                set -o pipefail
+                git show :2:output/ips.txt > /tmp/a.txt 2>/dev/null || : > /tmp/a.txt
+                git show :3:output/ips.txt > /tmp/b.txt 2>/dev/null || : > /tmp/b.txt
+                cat /tmp/a.txt /tmp/b.txt | { grep -E '^[0-9.]+$' || true; } | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n > /tmp/m.txt
+                if [ ! -s /tmp/m.txt ]; then git rebase --abort; exit 1; fi
+                cp /tmp/m.txt output/ips.txt
+              fi
+              for f in output/report.json output/netlas_state.json; do git checkout --theirs -- "$f" 2>/dev/null || true; done
+              git add output
+              GIT_EDITOR=true git rebase --continue || { git rebase --abort; exit 1; }
+            fi
+          done
+          exit 1
