@@ -59,9 +59,14 @@ jobs:
             if ! git pull --rebase; then
               # 冲突：合并两侧 ips.txt（并集、去重、排序），其余文件取本轮结果
               if git diff --name-only --diff-filter=U | grep -qvE '^output/(ips\.txt|report\.json|netlas_state\.json)$'; then git rebase --abort; exit 1; fi
-              git show :2:output/ips.txt > /tmp/a.txt 2>/dev/null || true
-              git show :3:output/ips.txt > /tmp/b.txt 2>/dev/null || true
-              cat /tmp/a.txt /tmp/b.txt | grep -E '^[0-9.]+$' | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n > output/ips.txt
+              if git diff --name-only --diff-filter=U | grep -qx 'output/ips.txt'; then
+                set -o pipefail
+                git show :2:output/ips.txt > /tmp/a.txt 2>/dev/null || : > /tmp/a.txt
+                git show :3:output/ips.txt > /tmp/b.txt 2>/dev/null || : > /tmp/b.txt
+                cat /tmp/a.txt /tmp/b.txt | { grep -E '^[0-9.]+$' || true; } | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n > /tmp/m.txt
+                if [ ! -s /tmp/m.txt ]; then git rebase --abort; exit 1; fi
+                cp /tmp/m.txt output/ips.txt
+              fi
               for f in output/report.json output/netlas_state.json; do git checkout --theirs -- "$f" 2>/dev/null || true; done
               git add output
               GIT_EDITOR=true git rebase --continue || { git rebase --abort; exit 1; }
