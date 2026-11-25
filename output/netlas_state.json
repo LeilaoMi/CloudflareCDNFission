@@ -1,0 +1,19 @@
+{
+ "query": "http.headers.server:\"cloudflare\" AND port:443 AND http.status_code:403 AND geo.country:US AND host_type:ip",
+ "queue": [
+  "13.142.0.0/15",
+  "13.144.0.0/12",
+  "13.160.0.0/11",
+  "13.192.0.0/10",
+  "14.0.0.0/7",
+  "16.0.0.0/4",
+  "32.0.0.0/3",
+  "64.0.0.0/2",
+  "128.0.0.0/1"
+ ],
+ "cycles_done": 0,
+ "pending": {
+  "cidr": "13.140.0.0/15",
+  "count": 188
+ }
+}
