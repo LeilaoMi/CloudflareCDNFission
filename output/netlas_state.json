@@ -1,11 +1,7 @@
 {
  "query": "http.headers.server:\"cloudflare\" AND port:443 AND http.status_code:403 AND geo.country:US AND host_type:ip",
  "queue": [
-  "23.27.128.0/17",
-  "23.28.0.0/14",
-  "23.32.0.0/11",
-  "23.64.0.0/10",
-  "23.128.0.0/9",
+  "23.240.0.0/12",
   "24.0.0.0/5",
   "32.0.0.0/3",
   "64.0.0.0/2",
